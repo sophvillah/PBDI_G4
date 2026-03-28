@@ -1,2 +1,2 @@
-# proyecto-biosidiseno1
+# PROYECTO DE BIODISEÑO 1
 # # GRUPO 4
