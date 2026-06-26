@@ -1,0 +1,611 @@
+#include <Wire.h>              // Librería para comunicación I2C (usada por MPU6050, MAX30205 y OLED)
+#include <MPU6050_light.h>     // Librería ligera para el sensor de movimiento MPU6050
+#include <Adafruit_GFX.h>      // Librería base de gráficos (necesaria para la pantalla OLED)
+#include <Adafruit_SSD1306.h>  // Librería específica del controlador de la pantalla OLED 0.96"
+
+// ===== PROTOTIPOS =====
+// Se declaran aquí arriba para que el compilador sepa que estas funciones existen
+// antes de ser usadas en el código, aunque estén definidas más abajo en el archivo.
+void mostrarMensaje(String msg, int tamano, bool limpiar);
+float leerTemperatura();
+void actualizarPantalla();
+int getBateria();
+void registrarPico(unsigned long tiempo);
+float calcularFrecuencia();
+float calcularDesviacionIntervalos();
+void dibujarCaritaFeliz(int x, int y);
+void dibujarCaritaPreocupada(int x, int y);
+void dibujarCaritaAlarmada(int x, int y);
+
+// ===== PANTALLA OLED =====
+#define SCREEN_WIDTH 128   // Ancho en pixeles de la pantalla OLED 0.96"
+#define SCREEN_HEIGHT 64   // Alto en pixeles de la pantalla OLED 0.96"
+// Se crea el objeto "display" que usaremos para dibujar todo en la pantalla.
+// El -1 significa que no usamos un pin de reset físico independiente.
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ===== SENSORES =====
+// Objeto del sensor MPU6050 (acelerómetro + giroscopio), usando el bus I2C "Wire"
+MPU6050 mpu(Wire);
+
+// ===== BUZZER =====
+#define BUZZER_PIN 25   // Pin donde está conectado el buzzer para las alarmas sonoras
+
+// ===== BOTON =====
+#define BOTON_PIN 4              // Pin donde está conectado el botón de encendido/apagado
+bool sistemaEncendido = true;    // Estado actual: true = encendido, false = apagado
+unsigned long tiempoBoton = 0;   // Guarda el último momento en que se presionó el botón (para evitar rebotes)
+
+// ===== VARIABLES TEMPERATURA =====
+float tempAnterior = 0;            // Temperatura de la lectura anterior (para calcular la velocidad de subida)
+float tempActual = 0;              // Temperatura actual medida por el MAX30205
+unsigned long tiempoUltimaTemp = 0; // Marca de tiempo de la última vez que se leyó la temperatura
+float tasaSubidaTemp = 0;          // Cuántos grados por minuto está subiendo la temperatura
+bool alertaFiebre = false;         // true si la temperatura actual indica fiebre
+
+// ===== VARIABLES CONVULSION (calibracion) =====
+// Estos valores fueron ajustados con pruebas reales sacudiendo el sensor con la mano,
+// simulando los movimientos repetitivos de una convulsión.
+
+#define UMBRAL_MAGNITUD       0.6   // Fuerza mínima (en g) que debe alcanzar un pico para contar como "sacudida"
+#define FREQ_MIN_HZ            2.0  // Frecuencia mínima (en Hz) típica de movimientos convulsivos
+#define FREQ_MAX_HZ            6.0  // Frecuencia máxima (en Hz) típica de movimientos convulsivos
+#define DURACION_MINIMA        2000 // Tiempo (ms) que el patrón debe sostenerse para confirmar convulsión real
+#define MAX_MUESTRAS_BUFFER    15   // Cuántos picos guardamos en memoria para analizar el patrón
+#define UMBRAL_DESVIACION      150.0 // Máxima variación permitida entre los intervalos de tiempo entre picos
+                                      // (entre más bajo, más "regular" debe ser el movimiento para contar)
+#define TIEMPO_SIN_PICO_RESET  800  // Si pasan más de 800ms sin ningún pico nuevo, asumimos que el movimiento paró
+#define TIEMPO_MIN_ENTRE_PICOS 80   // Tiempo mínimo (ms) entre un pico y otro, para no contar el mismo pico 2 veces
+
+// Buffer circular: guarda las marcas de tiempo (timestamp) de cada pico detectado.
+// Es "circular" porque cuando se llena, empieza a sobrescribir los datos más viejos.
+unsigned long bufferPicos[MAX_MUESTRAS_BUFFER];
+int indiceBuffer = 0;          // Posición actual donde se va a guardar el próximo pico
+int muestrasEnBuffer = 0;      // Cuántos picos hay actualmente guardados (máximo MAX_MUESTRAS_BUFFER)
+unsigned long ultimoPico = 0;  // Marca de tiempo del último pico registrado
+
+float magnitudAnterior = 0;  // Guarda la magnitud de la lectura anterior, para saber si está subiendo o bajando
+bool subiendo = false;       // true si la magnitud está en una fase de subida (necesario para detectar el "pico real")
+
+unsigned long tiempoInicioMovimiento = 0; // Cuándo empezó el patrón sospechoso de convulsión
+bool movimientoSostenido = false;          // true si el patrón sospechoso sigue activo sin interrupción
+bool alertaConvulsion = false;             // true si ya se confirmó que es una convulsión
+
+// ===== BUZZER TIMING =====
+// Variables para hacer sonar el buzzer en patrones (bips) sin usar delay(),
+// lo cual bloquearía el resto del programa.
+unsigned long tiempoUltimoBip = 0;
+bool buzzerActivo = false;
+
+// ===== ESTADOS =====
+// El sistema siempre está en uno de estos 3 estados, que determinan
+// qué se muestra en pantalla y qué sonido hace el buzzer.
+#define ESTADO_NORMAL     0
+#define ESTADO_FIEBRE     1
+#define ESTADO_CONVULSION 2
+int estadoActual = ESTADO_NORMAL;
+
+// ===== SETUP =====
+// Se ejecuta una sola vez al encender o reiniciar el ESP32.
+// Aquí se prepara todo el hardware antes de empezar el monitoreo continuo.
+void setup() {
+  Serial.begin(115200);  // Inicia la comunicación con la PC para ver mensajes de depuración
+  Wire.begin(21, 22);    // Inicia el bus I2C: SDA en pin 21, SCL en pin 22 (compartido por MPU6050, MAX30205 y OLED)
+
+  pinMode(BOTON_PIN, INPUT_PULLUP); // El botón usa resistencia interna, así que LOW = presionado
+  pinMode(BUZZER_PIN, OUTPUT);      // El buzzer es una salida que controlamos nosotros
+  digitalWrite(BUZZER_PIN, LOW);    // Aseguramos que el buzzer empiece apagado
+
+  // Se inicia la pantalla OLED en la dirección I2C estándar 0x3C
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error OLED");
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  mostrarMensaje("Iniciando CONI...", 1, true); // Mensaje de bienvenida en pantalla
+  delay(1500);
+
+  // Se inicia el sensor MPU6050 y se verifica que responda correctamente
+  byte status = mpu.begin();
+  if (status != 0) {
+    // Si el sensor no responde, se detiene el programa para evitar funcionar sin datos confiables
+    mostrarMensaje("ERROR MPU6050", 1, true);
+    Serial.println("ERROR MPU6050");
+    while (true);
+  }
+  Serial.println("MPU6050 OK");
+  mostrarMensaje("Calibrando...", 1, true);
+  delay(1000);
+  // calcOffsets() calcula automáticamente el "error de fábrica" del sensor,
+  // para que en reposo total marque 0 en vez de tener un pequeño desvío natural (drift).
+  // Es importante que el sensor esté quieto durante este paso.
+  mpu.calcOffsets();
+
+  // Se configura el sensor de temperatura MAX30205 en modo de medición continua,
+  // escribiendo directamente en sus registros por I2C (sin usar librería externa,
+  // ya que las librerías probadas daban lecturas erróneas).
+  Wire.beginTransmission(0x48); // 0x48 es la dirección I2C por defecto del MAX30205
+  Wire.write(0x01);             // Registro de configuración
+  Wire.write(0x00);             // Modo de operación normal/continuo
+  Wire.endTransmission();
+  delay(500);
+
+  // Se hace una primera lectura de temperatura para tener un valor de referencia inicial
+  tempActual = leerTemperatura();
+  tempAnterior = tempActual;
+  tiempoUltimaTemp = millis();
+
+  // Sonido de 2 bips ascendentes para indicar que el sistema arrancó correctamente
+  tone(BUZZER_PIN, 1000, 200);
+  delay(300);
+  tone(BUZZER_PIN, 1500, 200);
+  delay(300);
+
+  mostrarMensaje("Sistema listo!", 1, true);
+  delay(1000);
+}
+
+// ===== LOOP =====
+// Se ejecuta en bucle infinito mientras el ESP32 esté encendido.
+// Aquí ocurre todo el monitoreo en tiempo real.
+void loop() {
+
+  // --- BOTON ON/OFF ---
+  // Si el botón está presionado (LOW) y ya pasaron más de 500ms desde la última vez
+  // que se presionó (para evitar que un solo toque cuente como varios "clicks" por rebote eléctrico)
+  if (digitalRead(BOTON_PIN) == LOW && millis() - tiempoBoton > 500) {
+    tiempoBoton = millis();
+    sistemaEncendido = !sistemaEncendido; // Invierte el estado: si estaba encendido, se apaga, y viceversa
+
+    if (!sistemaEncendido) {
+      // Al apagar: se detiene cualquier sonido y se limpia la pantalla
+      noTone(BUZZER_PIN);
+      display.clearDisplay();
+      mostrarMensaje("Sistema apagado", 1, true);
+      delay(1000);
+      display.clearDisplay();
+      display.display();
+    } else {
+      // Al encender: se reinician todas las alertas y el buffer de movimiento,
+      // para empezar el monitoreo desde cero, evitando falsas alertas con datos viejos
+      alertaFiebre = false;
+      alertaConvulsion = false;
+      estadoActual = ESTADO_NORMAL;
+      muestrasEnBuffer = 0;
+      indiceBuffer = 0;
+      tone(BUZZER_PIN, 1000, 200);
+      mostrarMensaje("Sistema encendido", 1, true);
+      delay(1000);
+    }
+  }
+
+  // Si el sistema está apagado, no se hace nada más en este ciclo del loop
+  if (!sistemaEncendido) return;
+
+  // --- LECTURA DE TEMPERATURA ---
+  // Se mide la temperatura solo cada 5 segundos, no en cada ciclo,
+  // porque la temperatura corporal cambia lento y así ahorramos procesamiento
+  if (millis() - tiempoUltimaTemp >= 5000) {
+    tempAnterior = tempActual;
+    tempActual = leerTemperatura();
+
+    // Se calcula qué tan rápido está subiendo la temperatura, en °C por minuto.
+    // Esto es clave clínicamente: una subida MUY rápida de temperatura
+    // aumenta el riesgo de convulsión febril, no solo el valor absoluto.
+    tasaSubidaTemp = ((tempActual - tempAnterior) / 5.0) * 60.0;
+    tiempoUltimaTemp = millis();
+
+    // Si la temperatura alcanza el umbral de fiebre y todavía no había alerta activa,
+    // se activa la alerta de fiebre
+    if (tempActual >= 37.5 && !alertaFiebre) {
+      alertaFiebre = true;
+      estadoActual = ESTADO_FIEBRE;
+    }
+
+    // Si la temperatura baja lo suficiente, se desactiva la alerta de fiebre
+    // (se usa un umbral distinto al de activar, para evitar que la alerta
+    // se prenda y apague constantemente por pequeñas fluctuaciones)
+    if (tempActual < 38.0) {
+      alertaFiebre = false;
+      if (estadoActual == ESTADO_FIEBRE) {
+        estadoActual = ESTADO_NORMAL;
+        noTone(BUZZER_PIN);
+      }
+    }
+  }
+
+  // --- LECTURA DEL MPU6050 ---
+  mpu.update(); // Actualiza las lecturas internas del sensor
+  float aX = mpu.getAccX(); // Aceleración en el eje X (en g)
+  float aY = mpu.getAccY(); // Aceleración en el eje Y (en g)
+  float aZ = mpu.getAccZ(); // Aceleración en el eje Z (en g, incluye la gravedad terrestre ~1g)
+
+  // Se calcula la magnitud total del movimiento, restando la gravedad del eje Z
+  // (ya que en reposo Z siempre marca ~1g por la gravedad, y eso no es "movimiento real")
+  float magnitud = sqrt(aX*aX + aY*aY + (aZ - 1.0)*(aZ - 1.0));
+
+  Serial.print("RAW Mag: ");
+  Serial.println(magnitud, 3); // Debug para poder calibrar umbrales viendo los valores reales
+
+  // --- DETECCION DE PICOS POR CAMBIO DE DIRECCION ---
+  // En vez de solo verificar si la magnitud supera un umbral fijo (lo cual fallaba
+  // cuando el movimiento se mantenía sostenido sin "bajar"), aquí se detecta
+  // el momento exacto en que la magnitud deja de subir y empieza a bajar.
+  // Ese momento es un "pico" real de aceleración, sin importar si el valor
+  // se mantiene alto después.
+  unsigned long ahora = millis();
+
+  if (magnitud > magnitudAnterior) {
+    subiendo = true; // Estamos en la fase de subida de un posible pico
+  } else {
+    // Si veníamos subiendo y ahora la magnitud bajó, fue un pico.
+    // Solo lo contamos si supera el umbral mínimo Y si ya pasó suficiente
+    // tiempo desde el pico anterior (para no contar vibraciones diminutas como picos extra)
+    if (subiendo && magnitud > UMBRAL_MAGNITUD && (ahora - ultimoPico) > TIEMPO_MIN_ENTRE_PICOS) {
+      registrarPico(ahora);
+      Serial.println(">>> PICO REGISTRADO <<<");
+    }
+    subiendo = false;
+  }
+  magnitudAnterior = magnitud; // Se guarda el valor actual para comparar en el siguiente ciclo
+
+  // --- VERIFICAR SI HAY MOVIMIENTO RECIENTE ---
+  // Si el último pico fue hace más de 800ms, consideramos que el movimiento ya se detuvo
+  bool movimientoReciente = (ahora - ultimoPico <= TIEMPO_SIN_PICO_RESET);
+
+  // --- ANALIZAR REGULARIDAD DEL PATRON ---
+  bool patronRegular = false;
+  float frecuenciaHz = 0;
+  float desviacion = 0;
+  bool frecuenciaEnRango = false;
+  bool esRegular = false;
+
+  // Solo analizamos si tenemos suficientes picos guardados (mínimo 5) Y si el movimiento sigue activo
+  if (muestrasEnBuffer >= 5 && movimientoReciente) {
+    frecuenciaHz = calcularFrecuencia();           // Cuántos picos por segundo está habiendo
+    desviacion = calcularDesviacionIntervalos();   // Qué tan parejos son los intervalos entre picos
+
+    // Una convulsión real tiene una frecuencia específica (2-6Hz según literatura médica)
+    frecuenciaEnRango = (frecuenciaHz >= FREQ_MIN_HZ && frecuenciaHz <= FREQ_MAX_HZ);
+
+    // Y además ese ritmo debe ser CONSTANTE, no errático como al jugar
+    esRegular = (desviacion <= UMBRAL_DESVIACION);
+
+    // Solo se considera "patrón sospechoso de convulsión" si cumple ambas condiciones
+    patronRegular = frecuenciaEnRango && esRegular;
+
+    // Mensajes de depuración para poder calibrar los umbrales viendo los datos reales
+    Serial.print(">> Muestras: ");
+    Serial.print(muestrasEnBuffer);
+    Serial.print(" | Desviacion: ");
+    Serial.print(desviacion);
+    Serial.print(" | EnRango: ");
+    Serial.print(frecuenciaEnRango);
+    Serial.print(" | EsRegular: ");
+    Serial.println(esRegular);
+  } else if (!movimientoReciente) {
+    frecuenciaHz = 0; // Si no hay movimiento reciente, mostramos 0Hz en pantalla/serial
+  }
+
+  // --- CONFIRMAR CONVULSION ---
+  // Requisito clínico clave: para que sea una "convulsión FEBRIL" debe haber
+  // FIEBRE actualmente activa, además del patrón de movimiento sospechoso.
+  // Si solo hay movimiento sin fiebre, no se considera convulsión febril.
+  if (patronRegular && alertaFiebre) {
+    if (!movimientoSostenido) {
+      // Primera vez que se detecta el patrón: empezamos a contar el tiempo
+      tiempoInicioMovimiento = ahora;
+      movimientoSostenido = true;
+    }
+    // Solo se confirma como convulsión si el patrón se mantuvo sin interrupción
+    // por al menos 2 segundos (DURACION_MINIMA). Esto evita falsas alarmas
+    // por movimientos breves y casuales que por casualidad coincidan en frecuencia.
+    if (ahora - tiempoInicioMovimiento >= DURACION_MINIMA && !alertaConvulsion) {
+      alertaConvulsion = true;
+      estadoActual = ESTADO_CONVULSION;
+    }
+  } else {
+    // Si el patrón se rompió, reiniciamos el contador de tiempo sostenido
+    movimientoSostenido = false;
+
+    // Si ya había una alerta de convulsión activa y el movimiento ya paró completamente,
+    // volvemos al estado anterior (fiebre o normal, según corresponda)
+    if (alertaConvulsion && !movimientoReciente) {
+      alertaConvulsion = false;
+      noTone(BUZZER_PIN);
+      estadoActual = alertaFiebre ? ESTADO_FIEBRE : ESTADO_NORMAL;
+    }
+  }
+
+  // --- CONTROL DEL BUZZER (sin bloquear el programa) ---
+  // Se usa millis() en vez de delay() para que el buzzer pueda sonar en patrones
+  // mientras el resto del programa sigue funcionando normalmente (sensores, pantalla, botón)
+  if (estadoActual == ESTADO_CONVULSION) {
+    // Bip rápido y constante cada 300ms, alternando encendido/apagado, para sonar urgente
+    if (millis() - tiempoUltimoBip >= 300) {
+      tiempoUltimoBip = millis();
+      buzzerActivo = !buzzerActivo;
+      if (buzzerActivo) tone(BUZZER_PIN, 2000); // Tono agudo de alarma
+      else noTone(BUZZER_PIN);
+    }
+  } else if (estadoActual == ESTADO_FIEBRE) {
+    // Bip más espaciado y suave cada 2 segundos, menos urgente que la convulsión
+    if (millis() - tiempoUltimoBip >= 2000) {
+      tiempoUltimoBip = millis();
+      tone(BUZZER_PIN, 1000, 500);
+    }
+  } else {
+    noTone(BUZZER_PIN); // Estado normal: silencio total
+  }
+
+  // --- DEBUG GENERAL POR SERIAL ---
+  // Línea resumen que muestra el estado completo del sistema en cada ciclo,
+  // útil para monitorear y calibrar mientras se hacen pruebas
+  Serial.print("Temp: ");
+  Serial.print(tempActual, 2);
+  Serial.print(" | Mag: ");
+  Serial.print(magnitud, 2);
+  Serial.print(" | Freq: ");
+  Serial.print(frecuenciaHz, 2);
+  Serial.print("Hz | Regular: ");
+  Serial.print(patronRegular ? "SI" : "NO");
+  Serial.print(" | Fiebre: ");
+  Serial.print(alertaFiebre ? "SI" : "NO");
+  Serial.print(" | Estado: ");
+  Serial.println(estadoActual);
+
+  actualizarPantalla(); // Refresca lo que se muestra en el OLED según el estado actual
+
+  delay(50); // Pequeña pausa: el sensor MPU6050 se lee ~20 veces por segundo, suficiente para detectar patrones
+}
+
+// ===== FUNCIONES DE ANALISIS DE PATRON =====
+
+// Guarda la marca de tiempo de un pico nuevo en el buffer circular.
+// "Circular" significa que cuando se llena, el siguiente dato sobrescribe
+// el más antiguo, así siempre tenemos los últimos N picos más recientes.
+void registrarPico(unsigned long tiempo) {
+  bufferPicos[indiceBuffer] = tiempo;
+  indiceBuffer = (indiceBuffer + 1) % MAX_MUESTRAS_BUFFER; // Avanza la posición, y vuelve a 0 si llega al final
+  if (muestrasEnBuffer < MAX_MUESTRAS_BUFFER) muestrasEnBuffer++; // Cuenta cuántos picos hay guardados (hasta el máximo)
+  ultimoPico = tiempo; // Actualiza el momento del último pico, usado para saber si el movimiento sigue activo
+}
+
+// Calcula la frecuencia de los picos en Hz (sacudidas por segundo),
+// usando el tiempo que abarca desde el primer hasta el último pico guardado.
+float calcularFrecuencia() {
+  // Calculamos los índices del primer y último pico dentro del buffer circular
+  int primero = (indiceBuffer - muestrasEnBuffer + MAX_MUESTRAS_BUFFER) % MAX_MUESTRAS_BUFFER;
+  int ultimo = (indiceBuffer - 1 + MAX_MUESTRAS_BUFFER) % MAX_MUESTRAS_BUFFER;
+
+  unsigned long tiempoTotal = bufferPicos[ultimo] - bufferPicos[primero];
+  if (tiempoTotal == 0) return 0; // Evita dividir entre cero si solo hay 1 pico
+
+  // Frecuencia = (número de "espacios" entre picos) / (tiempo total que abarcan, en segundos)
+  float frecuencia = (float)(muestrasEnBuffer - 1) / (tiempoTotal / 1000.0);
+  return frecuencia;
+}
+
+// Calcula qué tan "regular" o "constante" es el ritmo de las sacudidas,
+// usando la desviación estándar de los intervalos de tiempo entre cada pico.
+// Una desviación BAJA significa que el ritmo es muy parejo (sospechoso de convulsión).
+// Una desviación ALTA significa que el ritmo es errático (más típico de jugar).
+float calcularDesviacionIntervalos() {
+  float intervalos[MAX_MUESTRAS_BUFFER];
+  int n = 0;
+
+  // Se calcula el intervalo de tiempo entre cada pico y el anterior
+  for (int i = 1; i < muestrasEnBuffer; i++) {
+    int idxActual = (indiceBuffer - muestrasEnBuffer + i + MAX_MUESTRAS_BUFFER) % MAX_MUESTRAS_BUFFER;
+    int idxAnterior = (indiceBuffer - muestrasEnBuffer + i - 1 + MAX_MUESTRAS_BUFFER) % MAX_MUESTRAS_BUFFER;
+
+    long intervalo = bufferPicos[idxActual] - bufferPicos[idxAnterior];
+    // Se descartan intervalos absurdos (negativos o mayores a 1 segundo), que serían errores de medición
+    if (intervalo > 0 && intervalo < 1000) {
+      intervalos[n++] = intervalo;
+    }
+  }
+
+  if (n < 2) return 999; // Si no hay suficientes datos válidos, se asume "muy irregular" por seguridad
+
+  // Se calcula el promedio de los intervalos
+  float suma = 0;
+  for (int i = 0; i < n; i++) suma += intervalos[i];
+  float promedio = suma / n;
+
+  // Se calcula la desviación estándar: mide qué tanto se alejan los intervalos del promedio.
+  // Fórmula estadística estándar: raíz cuadrada del promedio de las diferencias al cuadrado.
+  float sumaCuadrados = 0;
+  for (int i = 0; i < n; i++) {
+    sumaCuadrados += (intervalos[i] - promedio) * (intervalos[i] - promedio);
+  }
+  float desviacion = sqrt(sumaCuadrados / n);
+
+  return desviacion;
+}
+
+// ===== RESTO DE FUNCIONES =====
+
+// Lee la temperatura directamente del registro del sensor MAX30205 por I2C,
+// sin depender de una librería externa (las librerías probadas daban valores incorrectos).
+float leerTemperatura() {
+  Wire.beginTransmission(0x48); // Empieza comunicación con el sensor en su dirección I2C
+  Wire.write(0x00);             // Selecciona el registro 0x00, que contiene la temperatura
+  Wire.endTransmission(false);  // Termina el "write" pero mantiene la conexión abierta para leer después
+  Wire.requestFrom(0x48, 2);    // Pide 2 bytes de datos (la temperatura viene en 16 bits)
+
+  if (Wire.available() >= 2) {
+    byte msb = Wire.read(); // Byte más significativo (parte alta del número)
+    byte lsb = Wire.read(); // Byte menos significativo (parte baja del número)
+
+    // Se combinan ambos bytes en un solo número de 16 bits
+    int16_t raw = (int16_t)((msb << 8) | lsb);
+
+    // El sensor entrega la temperatura multiplicada por 256 (formato de punto fijo),
+    // así que se divide para obtener el valor real en grados Celsius
+    float temp = raw / 256.0;
+
+    // Se invierte el signo porque, según las pruebas con este sensor específico,
+    // el valor sale invertido (sube cuando debería bajar y viceversa)
+    temp = temp * -1;
+    return temp;
+  }
+
+  // Si el sensor no respondió correctamente, se devuelve el último valor conocido
+  // en vez de un dato inventado, para no generar alertas falsas
+  Serial.println("ERROR: MAX30205 no responde");
+  return tempActual;
+}
+
+// ===== CARITAS GRAFICAS =====
+// Estas funciones dibujan caritas simples usando círculos y líneas,
+// para dar una retroalimentación visual rápida y entendible del estado del sistema,
+// sin necesidad de leer texto.
+
+// Carita feliz: usada en estado NORMAL (todo bien)
+void dibujarCaritaFeliz(int x, int y) {
+  display.drawCircle(x, y, 18, WHITE);              // Contorno de la cara
+  display.fillCircle(x - 7, y - 5, 2, WHITE);       // Ojo izquierdo
+  display.fillCircle(x + 7, y - 5, 2, WHITE);       // Ojo derecho
+  // Sonrisa dibujada con 3 líneas conectadas formando una "U"
+  display.drawLine(x - 8, y + 4, x - 4, y + 8, WHITE);
+  display.drawLine(x - 4, y + 8, x + 4, y + 8, WHITE);
+  display.drawLine(x + 4, y + 8, x + 8, y + 4, WHITE);
+}
+
+// Carita preocupada: usada en estado FIEBRE (alerta moderada)
+void dibujarCaritaPreocupada(int x, int y) {
+  display.drawCircle(x, y, 18, WHITE);              // Contorno de la cara
+  display.drawCircle(x - 7, y - 5, 2, WHITE);       // Ojo izquierdo (más abierto que el feliz)
+  display.drawCircle(x + 7, y - 5, 2, WHITE);       // Ojo derecho
+  // Cejas levantadas, típicas de expresión de preocupación
+  display.drawLine(x - 10, y - 11, x - 4, y - 9, WHITE);
+  display.drawLine(x + 4, y - 9, x + 10, y - 11, WHITE);
+  // Boca ondulada (ni sonrisa ni mueca), transmite inquietud
+  display.drawLine(x - 7, y + 8, x - 2, y + 6, WHITE);
+  display.drawLine(x - 2, y + 6, x + 2, y + 8, WHITE);
+  display.drawLine(x + 2, y + 8, x + 7, y + 6, WHITE);
+}
+
+// Carita alarmada: usada en estado CONVULSION (máxima urgencia)
+void dibujarCaritaAlarmada(int x, int y) {
+  display.drawCircle(x, y, 18, WHITE);              // Contorno de la cara
+  // Ojos en forma de "X" (estilo cómic para expresar shock/alarma)
+  display.drawLine(x - 10, y - 8, x - 4, y - 2, WHITE);
+  display.drawLine(x - 10, y - 2, x - 4, y - 8, WHITE);
+  display.drawLine(x + 4, y - 8, x + 10, y - 2, WHITE);
+  display.drawLine(x + 4, y - 2, x + 10, y - 8, WHITE);
+  // Boca abierta tipo grito: círculo blanco con un círculo negro más pequeño dentro
+  // para simular el hueco de la boca abierta
+  display.fillCircle(x, y + 8, 5, WHITE);
+  display.fillCircle(x, y + 6, 4, BLACK);
+}
+
+// Dibuja toda la pantalla según el estado actual del sistema.
+// Se llama en cada ciclo del loop() para mantener la información actualizada.
+void actualizarPantalla() {
+  display.clearDisplay(); // Borra todo lo dibujado anteriormente antes de redibujar
+
+  if (estadoActual == ESTADO_CONVULSION) {
+    // Pantalla de máxima alerta: carita alarmada + texto grande "ALERTA"
+    dibujarCaritaAlarmada(20, 20);
+
+    display.setTextSize(2);
+    display.setCursor(42, 4);
+    display.println("ALERTA");
+    display.setTextSize(1);
+    display.setCursor(42, 20);
+    display.println("CONVULSION!");
+
+    // Aunque sea la alerta más grave, igual se sigue mostrando temperatura y batería,
+    // porque esa información sigue siendo útil para quien está atendiendo al niño
+    display.setCursor(0, 45);
+    display.print("Temp: ");
+    display.print(tempActual, 1);
+    display.println(" C");
+    display.setCursor(0, 55);
+    display.print("Bateria: ");
+    display.print(getBateria());
+    display.print("%");
+
+  } else if (estadoActual == ESTADO_FIEBRE) {
+    // Pantalla de alerta moderada: carita preocupada + temperatura grande
+    dibujarCaritaPreocupada(20, 18);
+
+    display.setTextSize(1);
+    display.setCursor(42, 2);
+    display.println("** FIEBRE **");
+    display.setTextSize(2);
+    display.setCursor(42, 14);
+    display.print(tempActual, 1);
+    display.println("C");
+
+    display.setTextSize(1);
+    display.setCursor(0, 40);
+    display.print("Subida: +");
+    display.print(tasaSubidaTemp, 1);
+    display.println(" C/min");
+
+    // Mensaje extra de advertencia si la temperatura sube muy rápido,
+    // ya que clínicamente eso aumenta el riesgo de convulsión febril
+    if (tasaSubidaTemp > 0.5) {
+      display.setCursor(0, 50);
+      display.println("! RIESGO CONVULSION !");
+    }
+    display.setCursor(0, 58);
+    display.print("Bat: ");
+    display.print(getBateria());
+    display.print("%");
+
+  } else {
+    // Pantalla normal: carita feliz + información básica sin urgencia
+    dibujarCaritaFeliz(20, 18);
+
+    display.setTextSize(1);
+    display.setCursor(42, 2);
+    display.println("CONI Monitor");
+    display.setTextSize(2);
+    display.setCursor(42, 14);
+    display.print(tempActual, 1);
+    display.println("C");
+
+    display.setTextSize(1);
+    display.setCursor(0, 42);
+    display.println("Estado: Normal");
+    display.setCursor(0, 54);
+    display.print("Bateria: ");
+    display.print(getBateria());
+    display.print("%");
+  }
+
+  display.display(); // Envía todo lo dibujado para que realmente aparezca en la pantalla física
+}
+
+// Calcula el porcentaje de batería restante, leyendo el voltaje
+// a través de un divisor de voltaje conectado al pin analógico 34.
+int getBateria() {
+  int raw = analogRead(34); // Lee el valor crudo del ADC (0 a 4095, ya que el ESP32 tiene ADC de 12 bits)
+
+  // Se convierte la lectura cruda a voltaje real.
+  // Se multiplica por 2 porque hay un divisor de voltaje (resistencias) que reduce
+  // el voltaje real de la batería a la mitad antes de llegar al pin del ESP32
+  // (esto protege al ESP32, que solo soporta hasta 3.3V en sus pines analógicos)
+  float voltaje = (raw / 4095.0) * 3.3 * 2;
+
+  // Se mapea el rango de voltaje típico de una batería LiPo (3.0V vacía, 4.2V llena)
+  // a un porcentaje de 0 a 100
+  int porcentaje = map((int)(voltaje * 100), 300, 420, 0, 100);
+
+  // Se limita el resultado entre 0 y 100, por si el voltaje real se sale un poco del rango esperado
+  return constrain(porcentaje, 0, 100);
+}
+
+// Función auxiliar para mostrar mensajes simples de texto en la pantalla,
+// usada principalmente durante el arranque del sistema (setup)
+void mostrarMensaje(String msg, int tamano, bool limpiar) {
+  if (limpiar) display.clearDisplay(); // Opcionalmente borra lo anterior antes de escribir
+  display.setTextSize(tamano);
+  display.setCursor(0, 20);
+  display.println(msg);
+  display.display(); // Sin esto, el texto se queda en memoria pero no aparece en pantalla
+}
